@@ -4,10 +4,17 @@
 #include <stdio.h>
 #include <fcntl.h>
 #include <assert.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/types.h>
+
+#ifndef __APPLE__
+#include <linux/dma-buf.h>
+#include <linux/dma-heap.h>
+#include <sys/ioctl.h>
+#endif
 
 std::atomic<int> offset = 0;
 
@@ -33,10 +40,51 @@ static void *malloc_with_fd(size_t len, int *fd) {
   return addr;
 }
 
+#ifndef __APPLE__
+static void *dma_heap_alloc(size_t len, int *fd) {
+  int heap_fd = open("/dev/dma_heap/system", O_RDWR | O_CLOEXEC);
+  if (heap_fd < 0) return MAP_FAILED;
+
+  struct dma_heap_allocation_data allocation = {};
+  allocation.len = len;
+  allocation.fd_flags = O_RDWR | O_CLOEXEC;
+  int ret;
+  do {
+    ret = ioctl(heap_fd, DMA_HEAP_IOCTL_ALLOC, &allocation);
+  } while (ret < 0 && errno == EINTR);
+  close(heap_fd);
+  if (ret != 0) return MAP_FAILED;
+
+  void *addr = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, allocation.fd, 0);
+  if (addr == MAP_FAILED) {
+    close(allocation.fd);
+    return MAP_FAILED;
+  }
+
+  *fd = allocation.fd;
+  return addr;
+}
+
+static int sync_dma_buffer(int fd, uint64_t flags) {
+  struct dma_buf_sync sync = {.flags = flags};
+  int ret;
+  do {
+    ret = ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
+  } while (ret < 0 && errno == EINTR);
+  return (ret == 0 || errno == ENOTTY) ? 0 : ret;
+}
+#endif
+
 void VisionBuf::allocate(size_t length) {
   this->len = length;
   this->mmap_len = this->len + sizeof(uint64_t);
-  this->addr = malloc_with_fd(this->mmap_len, &this->fd);
+#ifndef __APPLE__
+  this->addr = dma_heap_alloc(this->mmap_len, &this->fd);
+  if (this->addr != MAP_FAILED) this->handle = -1;
+#endif
+  if (this->addr == nullptr || this->addr == MAP_FAILED) {
+    this->addr = malloc_with_fd(this->mmap_len, &this->fd);
+  }
   this->frame_id = (uint64_t*)((uint8_t*)this->addr + this->len);
 }
 
@@ -59,6 +107,12 @@ void VisionBuf::init_yuv(size_t init_width, size_t init_height, size_t init_stri
 }
 
 int VisionBuf::sync(int dir) {
+#ifndef __APPLE__
+  assert(dir == VISIONBUF_SYNC_FROM_DEVICE || dir == VISIONBUF_SYNC_TO_DEVICE);
+  uint64_t access = dir == VISIONBUF_SYNC_FROM_DEVICE ? DMA_BUF_SYNC_READ : DMA_BUF_SYNC_WRITE;
+  int ret = sync_dma_buffer(this->fd, DMA_BUF_SYNC_START | access);
+  return ret == 0 ? sync_dma_buffer(this->fd, DMA_BUF_SYNC_END | access) : ret;
+#endif
   return 0;
 }
 
